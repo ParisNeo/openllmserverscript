@@ -45,7 +45,6 @@ read -r -p "Enter the directory for OpenLLM models (default: ${DEFAULT_MODEL_DIR
 MODEL_DIR="${MODEL_DIR:-${DEFAULT_MODEL_DIR}}"
 log "Using model directory: ${MODEL_DIR}"
 
-# Ensure the script runner (sudo user) is captured for group addition
 SUDO_INVOKING_USER="${SUDO_USER:-$(whoami)}"
 
 # 2. Create User and Group
@@ -113,80 +112,96 @@ sudo -u "${SERVICE_USER}" -H bash -c "
     \"${VENV_PATH}/bin/pip\" install openllm
     echo 'OpenLLM installation complete.'
 "
-if [ $? -ne 0 ]; then
+if [ $? -ne 0 ]; then # This checks the exit status of the sudo command
     error "Failed to install OpenLLM as user '${SERVICE_USER}'."
 fi
 log "OpenLLM installed successfully in ${VENV_PATH}."
 
 OPENLLM_EXEC="${VENV_PATH}/bin/openllm"
-SELECTED_MODELS_ARRAY=() # Initialize array to hold all selected models
+SELECTED_TARGETS_ARRAY=() # Stores targets to start (local paths or Hub IDs)
 
-# 7. Import Local Models (Optional)
-log "--- Local Model Import ---"
-read -r -p "Do you want to import and serve local model files? (y/N): " IMPORT_LOCAL_CHOICE
-IMPORT_LOCAL_CHOICE=$(echo "${IMPORT_LOCAL_CHOICE}" | tr '[:upper:]' '[:lower:]')
+# 7. Handle Local Models (Optional)
+log "--- Local Model Setup ---"
+read -r -p "Do you want to set up and serve local model files? (y/N): " SETUP_LOCAL_CHOICE
+SETUP_LOCAL_CHOICE=$(echo "${SETUP_LOCAL_CHOICE}" | tr '[:upper:]' '[:lower:]')
 
-if [[ "${IMPORT_LOCAL_CHOICE}" == "y" || "${IMPORT_LOCAL_CHOICE}" == "yes" ]]; then
-    while true; do
-        log "Importing a local model..."
-        read -r -p "Enter a custom Model ID for OpenLLM (e.g., my-local-llama-7b): " LOCAL_MODEL_ID
-        if [ -z "$LOCAL_MODEL_ID" ]; then
-            warn "Model ID cannot be empty."
+if [[ "${SETUP_LOCAL_CHOICE}" == "y" || "${SETUP_LOCAL_CHOICE}" == "yes" ]]; then
+    while true; do # This is the start of the while loop
+        echo ""
+        log "Setting up a local model..."
+        read -r -p "Enter a unique Service ID for this local model (e.g., my-local-llama-7b): " LOCAL_SERVICE_ID
+        if [ -z "$LOCAL_SERVICE_ID" ]; then
+            warn "Service ID cannot be empty."
             continue
         fi
 
-        read -r -p "Enter the full path to your model file (e.g., /path/to/model.gguf) or directory: " LOCAL_MODEL_PATH
+        ALREADY_EXISTS=0
+        for existing_target_info_str in "${SELECTED_TARGETS_ARRAY[@]}"; do
+            # Extract service ID from stored string (assuming format type:service_id:path:backend)
+            existing_service_id=$(echo "$existing_target_info_str" | cut -d':' -f2)
+            if [[ "$existing_service_id" == "$LOCAL_SERVICE_ID" ]]; then
+                warn "Service ID '$LOCAL_SERVICE_ID' is already in use. Please choose a different one."
+                ALREADY_EXISTS=1
+                break
+            fi
+        done # Done for the inner for loop
+        if [[ "$ALREADY_EXISTS" -eq 1 ]]; then
+            continue
+        fi
+
+        read -r -p "Enter the full path to your local model file (e.g., /path/to/model.gguf) or directory: " LOCAL_MODEL_PATH
         if [ ! -e "$LOCAL_MODEL_PATH" ]; then
             warn "Path '$LOCAL_MODEL_PATH' does not exist."
             continue
         fi
 
-        MODEL_TYPE_ARG=""
-        read -r -p "Is this a GGUF model file? (y/N): " IS_GGUF
-        IS_GGUF=$(echo "${IS_GGUF}" | tr '[:upper:]' '[:lower:]')
-        if [[ "${IS_GGUF}" == "y" || "${IS_GGUF}" == "yes" ]]; then
-            MODEL_TYPE_ARG="--model-type ctransformers"
-            log "GGUF model selected. Will use --model-type ctransformers."
-        else
-            read -r -p "Optional: Specify HuggingFace model type (e.g., llama, mistral, or leave blank for auto-detection from config.json): " SPECIFIC_MODEL_TYPE
-            if [ -n "$SPECIFIC_MODEL_TYPE" ]; then
-                MODEL_TYPE_ARG="--model-type ${SPECIFIC_MODEL_TYPE}"
+        if ! sudo -u "${SERVICE_USER}" test -r "${LOCAL_MODEL_PATH}"; then
+            warn "User '${SERVICE_USER}' may not have read access to '${LOCAL_MODEL_PATH}'."
+            warn "Please ensure permissions are set correctly for '${LOCAL_MODEL_PATH}' before the service starts."
+            # continue # Decide if this should be a hard stop
+        fi
+
+        MODEL_TYPE_FOR_START_LOGIC="local_hfdir"
+        OPENLLM_START_MODEL_ARG="--model-id \"${LOCAL_MODEL_PATH}\"" # Default for HF directory
+
+        read -r -p "Is this a single GGUF model file? (y/N): " IS_GGUF
+        IS_GGUF_LOWER=$(echo "${IS_GGUF}" | tr '[:upper:]' '[:lower:]') # Use a different var for lower
+        if [[ "${IS_GGUF_LOWER}" == "y" || "${IS_GGUF_LOWER}" == "yes" ]]; then
+            if [[ ! -f "$LOCAL_MODEL_PATH" ]]; then
+                warn "'$LOCAL_MODEL_PATH' is not a file. Expected a GGUF file."
+                continue
             fi
-        fi
-
-        log "Attempting to import '${LOCAL_MODEL_ID}' from '${LOCAL_MODEL_PATH}'..."
-        IMPORT_CMD="export PATH=\"${VENV_PATH}/bin:\$PATH\"; \
-                    export OPENLLM_HOME=\"${MODEL_DIR}\"; \
-                    export TRANSFORMERS_OFFLINE=1; \
-                    export HF_HUB_OFFLINE=1; \
-                    \"${OPENLLM_EXEC}\" import \"${LOCAL_MODEL_ID}\" \"${LOCAL_MODEL_PATH}\" ${MODEL_TYPE_ARG}"
-
-        if sudo -u "${SERVICE_USER}" -H bash -c "${IMPORT_CMD}"; then
-            log "Model '${LOCAL_MODEL_ID}' imported successfully."
-            SELECTED_MODELS_ARRAY+=("${LOCAL_MODEL_ID}")
+            MODEL_TYPE_FOR_START_LOGIC="local_gguf"
+            # For GGUF, OpenLLM expects: openllm start <runner_usually_ctransformers> --model-id /path/to/file.gguf
+            OPENLLM_START_MODEL_ARG="ctransformers --model-id \"${LOCAL_MODEL_PATH}\""
+            log "GGUF model selected. Will use 'ctransformers' runner with the specified model path."
         else
-            warn "Failed to import model '${LOCAL_MODEL_ID}'. Check the path, model type, and permissions."
-            warn "Make sure the '${SERVICE_USER}' user has read access to '${LOCAL_MODEL_PATH}'."
+            if [[ ! -d "$LOCAL_MODEL_PATH" ]]; then
+                warn "'$LOCAL_MODEL_PATH' is not a directory. Expected a HuggingFace model directory."
+                continue
+            fi
+            log "HuggingFace model directory selected. OpenLLM will attempt auto-detection using the model path."
         fi
 
-        read -r -p "Import another local model? (y/N): " IMPORT_ANOTHER
-        IMPORT_ANOTHER=$(echo "${IMPORT_ANOTHER}" | tr '[:upper:]' '[:lower:]')
-        if [[ "${IMPORT_ANOTHER}" != "y" && "${IMPORT_ANOTHER}" != "yes" ]]; then
-            break
+        # Store: type_for_logic : service_id_for_naming : openllm_start_model_argument_string
+        SELECTED_TARGETS_ARRAY+=("${MODEL_TYPE_FOR_START_LOGIC}:${LOCAL_SERVICE_ID}:${OPENLLM_START_MODEL_ARG}")
+        log "Local model '${LOCAL_SERVICE_ID}' from path '${LOCAL_MODEL_PATH}' added for service creation."
+
+        read -r -p "Add another local model? (y/N): " ADD_ANOTHER_LOCAL
+        ADD_ANOTHER_LOCAL_LOWER=$(echo "${ADD_ANOTHER_LOCAL}" | tr '[:upper:]' '[:lower:]') # Use a different var
+        if [[ "${ADD_ANOTHER_LOCAL_LOWER}" != "y" && "${ADD_ANOTHER_LOCAL_LOWER}" != "yes" ]]; then
+            break # Exit the while true loop
         fi
-        echo "" # Newline for readability
-    done
-fi
+    done # This is the 'done' for the 'while true' loop
+fi # This is the 'fi' for the 'if [[ "${SETUP_LOCAL_CHOICE}" ... ]]'
 
 # 8. List and Select Models from Hugging Face Hub (Optional)
 log "--- Hugging Face Hub Model Selection ---"
 read -r -p "Do you want to list and select models from Hugging Face Hub to install? (y/N): " FETCH_HUB_MODELS_CHOICE
-FETCH_HUB_MODELS_CHOICE=$(echo "${FETCH_HUB_MODELS_CHOICE}" | tr '[:upper:]' '[:lower:]')
+FETCH_HUB_MODELS_CHOICE_LOWER=$(echo "${FETCH_HUB_MODELS_CHOICE}" | tr '[:upper:]' '[:lower:]')
 
-if [[ "${FETCH_HUB_MODELS_CHOICE}" == "y" || "${FETCH_HUB_MODELS_CHOICE}" == "yes" ]]; then
+if [[ "${FETCH_HUB_MODELS_CHOICE_LOWER}" == "y" || "${FETCH_HUB_MODELS_CHOICE_LOWER}" == "yes" ]]; then
     log "Fetching list of available OpenLLM models from Hub..."
-    # Note: Set HF_TOKEN in environment if you need to access gated models from Hub
-    # export HF_TOKEN="your_token" # This should be done by the user in their shell, not hardcoded
     AVAILABLE_MODELS_OUTPUT=$(sudo -u "${SERVICE_USER}" -H bash -c "
         export PATH=\"${VENV_PATH}/bin:\$PATH\"
         export OPENLLM_HOME=\"${MODEL_DIR}\"
@@ -201,7 +216,7 @@ if [[ "${FETCH_HUB_MODELS_CHOICE}" == "y" || "${FETCH_HUB_MODELS_CHOICE}" == "ye
             mapfile -t HUB_MODELS_LIST < <(echo "$AVAILABLE_MODELS_OUTPUT" | jq -r '.[]')
         else
             warn "jq not found. Parsing model list with basic tools. May not be perfect for complex names."
-            mapfile -t HUB_MODELS_LIST < <(echo "$AVAILABLE_MODELS_OUTPUT" | tr -s ' ' '\n' | grep -vE '^\s*\[|\]\s*$|^\s*,$' | sed 's/["',]//g' | awk 'NF')
+            mapfile -t HUB_MODELS_LIST < <(echo "$AVAILABLE_MODELS_OUTPUT" | tr -s '[:space:],[]"' '\n' | grep -vE '^\s*$' | awk 'NF')
         fi
     fi
 
@@ -214,41 +229,74 @@ if [[ "${FETCH_HUB_MODELS_CHOICE}" == "y" || "${FETCH_HUB_MODELS_CHOICE}" == "ye
         done
         echo ""
         read -r -p "Enter Hub model IDs to install and run, separated by spaces (e.g., opt llama): " SELECTED_HUB_MODELS_INPUT
-        IFS=' ' read -r -a SELECTED_HUB_MODELS_ARRAY <<< "${SELECTED_HUB_MODELS_INPUT}"
-        for hub_model in "${SELECTED_HUB_MODELS_ARRAY[@]}"; do
-            if [[ -n "$hub_model" ]]; then # Ensure not empty
-                SELECTED_MODELS_ARRAY+=("${hub_model}")
+        IFS=' ' read -r -a SELECTED_HUB_MODELS_ARRAY_TEMP <<< "${SELECTED_HUB_MODELS_INPUT}"
+        for hub_model_id_raw in "${SELECTED_HUB_MODELS_ARRAY_TEMP[@]}"; do
+            if [[ -n "$hub_model_id_raw" ]]; then
+                # Ensure service ID uniqueness for Hub models too
+                HUB_SERVICE_ID_BASE=$(echo "${hub_model_id_raw}" | tr '/' '-') # Basic sanitization for temp ID
+                temp_hub_service_id="${HUB_SERVICE_ID_BASE}"
+                counter=1
+                ALREADY_EXISTS=0
+                while true; do
+                    ALREADY_EXISTS=0
+                    for existing_target_info_str in "${SELECTED_TARGETS_ARRAY[@]}"; do
+                        existing_service_id=$(echo "$existing_target_info_str" | cut -d':' -f2)
+                        if [[ "$existing_service_id" == "$temp_hub_service_id" ]]; then
+                            ALREADY_EXISTS=1
+                            break
+                        fi
+                    done
+                    if [[ "$ALREADY_EXISTS" -eq 0 ]]; then
+                        break # Unique ID found
+                    fi
+                    temp_hub_service_id="${HUB_SERVICE_ID_BASE}-${counter}"
+                    counter=$((counter + 1))
+                done
+                
+                # Store: type_for_logic : service_id_for_naming : openllm_start_model_argument_string
+                SELECTED_TARGETS_ARRAY+=("hub:${temp_hub_service_id}:\"${hub_model_id_raw}\"")
+                log "Hub model '${hub_model_id_raw}' (Service ID: ${temp_hub_service_id}) added for service creation."
             fi
         done
     fi
 fi
 
-# 9. Create and Start Services for ALL selected models
-if [ ${#SELECTED_MODELS_ARRAY[@]} -eq 0 ]; then
+# 9. Create and Start Services for ALL selected targets
+if [ ${#SELECTED_TARGETS_ARRAY[@]} -eq 0 ]; then
     log "No models (neither local nor Hub) selected to run as services. Script will exit."
-    log "You can manually import models using: sudo -u ${SERVICE_USER} -H OPENLLM_HOME=${MODEL_DIR} ${OPENLLM_EXEC} import <id> <path>"
-    log "And start them using: sudo -u ${SERVICE_USER} -H OPENLLM_HOME=${MODEL_DIR} ${OPENLLM_EXEC} start <model_id>"
     exit 0
 fi
 
 log "--- Creating and Starting Services ---"
 CURRENT_PORT=$START_PORT
-# Deduplicate SELECTED_MODELS_ARRAY in case a local ID matched a hub ID
-UNIQUE_SELECTED_MODELS_ARRAY=($(echo "${SELECTED_MODELS_ARRAY[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
 
-for model_id_for_service in "${UNIQUE_SELECTED_MODELS_ARRAY[@]}"; do
-    log "Processing model: ${model_id_for_service}"
+for target_info_str in "${SELECTED_TARGETS_ARRAY[@]}"; do
+    # Stored format: type_for_logic:service_id_for_naming:openllm_start_model_argument_string
+    # Example local GGUF: local_gguf:my-local-model:ctransformers --model-id "/path/to/model.gguf"
+    # Example local HFDir: local_hfdir:my-other-model:--model-id "/path/to/dir"
+    # Example Hub: hub:Mistral-7B-Instruct:"MistralAi/Mistral-7B-Instruct-v0.1"
 
-    # Sanitize model_id for service name (replace / with -, remove other unsafe chars)
-    sanitized_model_name=$(echo "${model_id_for_service}" | tr '/' '-' | tr -cd '[:alnum:]._-')
-    service_name="openllm-${sanitized_model_name}.service"
+    target_type=$(echo "$target_info_str" | cut -d':' -f1)
+    service_id_for_naming=$(echo "$target_info_str" | cut -d':' -f2)
+    # The rest of the string is the model argument for openllm start
+    openllm_model_arg_string=$(echo "$target_info_str" | cut -d':' -f3-)
+    
+    log "Processing target: Type='${target_type}', ServiceID='${service_id_for_naming}', OpenLLM Arg='${openllm_model_arg_string}'"
+
+    # Sanitize the service_id_for_naming to create the actual service file name
+    sanitized_service_name_base=$(echo "${service_id_for_naming}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+    service_name="openllm-${sanitized_service_name_base}.service"
     service_file="/etc/systemd/system/${service_name}"
 
-    log "Creating systemd service file: ${service_file} for model ${model_id_for_service} on port ${CURRENT_PORT}"
+    log "Creating systemd service file: ${service_file} for '${service_id_for_naming}' on port ${CURRENT_PORT}"
+
+    EXEC_START_CMD="${OPENLLM_EXEC} start ${openllm_model_arg_string} --port ${CURRENT_PORT}"
+    # One could add --working-dir "${MODEL_DIR}" if openllm start needs it, but OPENLLM_HOME should suffice.
+    # Add other common flags if needed: e.g. --workers 1
 
     cat << EOF > "${service_file}"
 [Unit]
-Description=OpenLLM Server for ${model_id_for_service}
+Description=OpenLLM Server for ${service_id_for_naming}
 After=network.target
 
 [Service]
@@ -259,18 +307,14 @@ Environment="OPENLLM_HOME=${MODEL_DIR}"
 Environment="PATH=${VENV_PATH}/bin:/usr/bin:/bin"
 Environment="TRANSFORMERS_OFFLINE=1"
 Environment="HF_HUB_OFFLINE=1"
-# If you use models requiring specific CUDA visibility (e.g., with bitsandbytes or multi-GPU)
-# Environment="CUDA_VISIBLE_DEVICES=0" # Example: use first GPU
+# If you use models requiring specific CUDA visibility
+# Environment="CUDA_VISIBLE_DEVICES=0"
 
-# The 'openllm start' command will download the model if it's a Hub ID and not already present.
-# For imported local models, it will use the existing files.
-ExecStart=${OPENLLM_EXEC} start ${model_id_for_service} --port ${CURRENT_PORT}
-# Add other 'openllm start' flags if needed, e.g.:
-# ExecStart=${OPENLLM_EXEC} start ${model_id_for_service} --port ${CURRENT_PORT} --workers 1 --model-version <sha_if_needed>
+ExecStart=${EXEC_START_CMD}
 
 Restart=always
-RestartSec=10 # Increased restart delay
-Type=simple   # Default, but explicit
+RestartSec=10
+Type=simple
 
 [Install]
 WantedBy=multi-user.target
@@ -282,8 +326,10 @@ EOF
 
     log "Attempting to start service ${service_name}..."
     if systemctl start "${service_name}"; then
-        log "Service ${service_name} started successfully for model ${model_id_for_service} on port ${CURRENT_PORT}."
-        log "If this is a Hub model being downloaded for the first time, it might take a while to become ready."
+        log "Service ${service_name} started successfully for '${service_id_for_naming}' on port ${CURRENT_PORT}."
+        if [[ "${target_type}" == "hub" ]]; then
+            log "If this is a Hub model being downloaded for the first time, it might take a while to become ready."
+        fi
         log "Check status with: systemctl status ${service_name}"
         log "Check logs with: journalctl -u ${service_name} -f"
     else
@@ -302,6 +348,6 @@ log "Virtual environment: ${VENV_PATH}"
 log "Make sure user '${SUDO_INVOKING_USER}' logs out and back in if they need to manage files in ${MODEL_DIR} directly."
 log "Installed services can be managed with systemctl (status, stop, start, restart)."
 log "For example, to check all openllm services: systemctl list-units 'openllm-*.service'"
-log "If you imported local models, ensure the '${SERVICE_USER}' user has persistent read access to their original paths if OpenLLM symlinks or only references them."
+log "If you used local models, ensure the '${SERVICE_USER}' user has persistent read access to their original paths."
 
 exit 0
